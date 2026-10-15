@@ -130,9 +130,8 @@ static void OCTOSPI1_GPIO_Init(void)
 static void OCTOSPI1_Core_Init(void)
 {
     /* ---- Enable clock OctoSPI1 ----------------------------------------- */
-    /* Source clock OctoSPI = HCLK (250 MHz) via RCC->CCIPR4                */
-    /* OCTOSPI1SEL = 00 → HCLK (default)                                    */
-    RCC->AHB3ENR |= RCC_AHB3ENR_OCTOSPI1EN;
+    /* STM32H523: OCTOSPI1 is on AHB4 bus                                   */
+    RCC->AHB4ENR |= RCC_AHB4ENR_OCTOSPI1EN;
     __DSB();
 
     /* ---- Pastikan OctoSPI tidak dalam mode aktif ----------------------- */
@@ -163,15 +162,15 @@ static void OCTOSPI1_Core_Init(void)
     OCTOSPI1->DCR4 = 0U;
 
     /* ---- CR: Control Register ------------------------------------------
-     * FSEL   [7]    = 0 → Flash 1 selected (NCS1)
-     * DQM    [6]    = 0 → Dual Quad Mode disabled (single flash)
-     * FMODE [27:26] = 00 → Indirect Write Mode (default)
+     * MSEL   [7]    = 0 → Memory 1 selected (NCS1)
+     * DMM    [6]    = 0 → Dual Memory Mode disabled (single flash)
+     * FMODE [29:28] = 00 → Indirect Write Mode (default)
      * FTHRES[12:8]  = 0 → FIFO threshold = 1 byte
      * -------------------------------------------------------------------- */
     OCTOSPI1->CR = (0U << OCTOSPI_CR_FMODE_Pos)
                  | (0U << OCTOSPI_CR_FTHRES_Pos)
-                 | (0U << OCTOSPI_CR_DQM_Pos)
-                 | (0U << OCTOSPI_CR_FSEL_Pos);
+                 | (0U << OCTOSPI_CR_DMM_Pos)
+                 | (0U << OCTOSPI_CR_MSEL_Pos);
 
     /* ---- Enable OctoSPI ------------------------------------------------ */
     OCTOSPI1->CR |= OCTOSPI_CR_EN;
@@ -223,7 +222,7 @@ void OCTOSPI1_LL_EnableQuadMode(void)
  *    → CPU bisa baca/eksekusi langsung dari 0x90000000
  *    → TIDAK BOLEH ada akses indirect lagi (DLR, DR, dll)
  * ========================================================================= */
-static void OCTOSPI1_MemoryMapped_Init(void)
+void OCTOSPI1_LL_MemoryMapped(void)
 {
     wait_not_busy();
 
@@ -246,8 +245,10 @@ static void OCTOSPI1_MemoryMapped_Init(void)
                   | (2U  << OCTOSPI_CCR_ADSIZE_Pos)   /* Addr: 24-bit       */
                   | (2U  << OCTOSPI_CCR_ABMODE_Pos)   /* AltByte: Quad      */
                   | (0U  << OCTOSPI_CCR_ABSIZE_Pos)   /* AltByte: 1 byte    */
-                  | (FLASH_DUMMY_CYCLES << OCTOSPI_CCR_DCYC_Pos) /* Dummy   */
                   | (2U  << OCTOSPI_CCR_DMODE_Pos);   /* Data: Quad         */
+
+    /* ---- TCR: Timing Configuration (Dummy cycles) ------------------------ */
+    OCTOSPI1->TCR = (FLASH_DUMMY_CYCLES << OCTOSPI_TCR_DCYC_Pos);
 
     /* ---- IR: Instruction — Fast Read Quad I/O command ------------------- */
     OCTOSPI1->IR  = FLASH_CMD_READ_QUAD;
@@ -265,15 +266,24 @@ static void OCTOSPI1_MemoryMapped_Init(void)
 }
 
 /* =========================================================================
- * PUBLIC: OCTOSPI1_LL_Init()
- *
- * Panggil fungsi ini dari main() sebelum jump ke aplikasi.
- * Setelah return: flash eksternal terpeta di 0x90000000
+ * PUBLIC: OCTOSPI1_LL_IndirectInit()
+ * Inisialisasi GPIO, Core register, dan aktifkan Quad mode pada flash.
+ * Tetap dalam mode Indirect (bisa Read/Write byte register).
  * ========================================================================= */
-void OCTOSPI1_LL_Init(void)
+void OCTOSPI1_LL_IndirectInit(void)
 {
     OCTOSPI1_GPIO_Init();
     OCTOSPI1_Core_Init();
     OCTOSPI1_LL_EnableQuadMode();
-    OCTOSPI1_MemoryMapped_Init();
 }
+
+/* =========================================================================
+ * PUBLIC: OCTOSPI1_LL_Init()
+ * Init lengkap langsung sampai Memory-Mapped (shortcut jika tidak butuh staging)
+ * ========================================================================= */
+void OCTOSPI1_LL_Init(void)
+{
+    OCTOSPI1_LL_IndirectInit();
+    OCTOSPI1_LL_MemoryMapped();
+}
+

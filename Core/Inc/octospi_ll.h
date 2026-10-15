@@ -25,15 +25,6 @@ extern "C" {
 #define OCTOSPI1_MM_BASE        0x90000000UL
 
 /* -----------------------------------------------------------------------
- * Offset aplikasi di dalam flash eksternal
- * Misal aplikasi di-flash mulai dari byte 0 flash eksternal
- * ----------------------------------------------------------------------- */
-#define APP_OFFSET_IN_EXTFLASH  0x00000000UL
-
-/* Alamat lengkap reset handler vektor aplikasi di memory-mapped space    */
-#define APP_MM_ADDRESS          (OCTOSPI1_MM_BASE + APP_OFFSET_IN_EXTFLASH)
-
-/* -----------------------------------------------------------------------
  * Command Macronix MX25L/MX66L (Quad SPI, 1-1-4 Fast Read)
  * ----------------------------------------------------------------------- */
 #define FLASH_CMD_READ_QUAD     0xEB  /* Fast Read Quad I/O              */
@@ -44,13 +35,20 @@ extern "C" {
 /* Jumlah dummy cycles untuk Fast Read Quad I/O @ frekuensi tinggi       */
 #define FLASH_DUMMY_CYCLES      6
 
-/* Inisialisasi OctoSPI1 ke mode Memory-Mapped (Quad, 1-1-4)            */
-void OCTOSPI1_LL_Init(void);
+/* Inisialisasi OctoSPI1 phase 1: GPIO + Core register (Indirect mode)      */
+/* Dipanggil di awal bootloader, sebelum baca META / CRC dari flash          */
+void OCTOSPI1_LL_IndirectInit(void);
 
-/* Fungsi bantu: kirim 1 command SPI sederhana (indirect write)          */
+/* Inisialisasi OctoSPI1 phase 2: switch ke Memory-Mapped (XIP) mode        */
+/* Dipanggil tepat sebelum Jump_To_Address(), TIDAK boleh ada akses indirect */
+/* lagi setelah fungsi ini dipanggil!                                        */
+void OCTOSPI1_LL_MemoryMapped(void);
+
+/* Fungsi bantu: kirim 1 command SPI sederhana (indirect write, 1-wire)     */
+/* Dipakai untuk WREN, EQIO, dsb.                                           */
 void OCTOSPI1_LL_SendCmd(uint8_t cmd);
 
-/* Aktifkan Quad mode pada flash Macronix via EQIO command               */
+/* Aktifkan Quad mode pada flash Macronix via EQIO command (0x35)           */
 void OCTOSPI1_LL_EnableQuadMode(void);
 
 #ifdef __cplusplus

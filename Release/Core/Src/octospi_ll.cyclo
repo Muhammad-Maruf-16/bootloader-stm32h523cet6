@@ -1,0 +1,5 @@
+../Core/Src/octospi_ll.c:183:6:OCTOSPI1_LL_SendCmd	3
+../Core/Src/octospi_ll.c:208:6:OCTOSPI1_LL_EnableQuadMode	2
+../Core/Src/octospi_ll.c:225:6:OCTOSPI1_LL_MemoryMapped	2
+../Core/Src/octospi_ll.c:273:6:OCTOSPI1_LL_IndirectInit	1
+../Core/Src/octospi_ll.c:284:6:OCTOSPI1_LL_Init	1
