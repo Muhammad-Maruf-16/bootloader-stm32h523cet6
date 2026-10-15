@@ -2,7 +2,19 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Bootloader STM32H523CET6 — XIP via OctoSPI Memory-Mapped
+  *
+  * ALUR:
+  *  1. Init clock (LL)
+  *  2. Init GPIO (LL)
+  *  3. Init OctoSPI → Memory-Mapped mode (bare-metal register)
+  *  4. Validasi: cek apakah MSP di 0x90000000 valid (SRAM range)
+  *  5. Jump ke Reset_Handler aplikasi di flash eksternal (0x90000000)
+  *
+  * CATATAN:
+  *  - Tidak ada copy ke SRAM — CPU langsung eksekusi dari 0x90000000 (XIP)
+  *  - OctoSPI TIDAK boleh di-deinit setelah jump (flash tetap harus aktif)
+  *  - Linker script aplikasi harus set FLASH origin = 0x90000000
   ******************************************************************************
   * @attention
   *
@@ -16,23 +28,35 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "octospi.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "octospi_ll.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+/* Tipe function pointer ke Reset_Handler aplikasi                           */
+typedef void (*pFunction)(void);
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/*
+ * APP_ADDRESS: alamat awal aplikasi di memory-mapped OctoSPI
+ * Ini adalah awal dari flash eksternal setelah di-map ke 0x90000000
+ *
+ * Offset bisa diubah jika ada header/metadata di awal flash, misal:
+ *   #define APP_ADDRESS  (OCTOSPI1_MM_BASE + 0x10000)  // app mulai di +64KB
+ */
+#define APP_ADDRESS     APP_MM_ADDRESS  /* = 0x90000000 dari octospi_ll.h   */
 
 /* USER CODE END PD */
 
@@ -49,12 +73,80 @@
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-/* USER CODE BEGIN PFP */
 
+/* USER CODE BEGIN PFP */
+static void Jump_To_App(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/**
+  * @brief  Jump ke aplikasi di flash eksternal (XIP, memory-mapped OctoSPI)
+  *
+  *         Langkah:
+  *         1. Baca MSP dari word pertama di APP_ADDRESS (offset 0)
+  *         2. Baca Reset_Handler dari word kedua di APP_ADDRESS (offset +4)
+  *         3. Validasi: MSP harus menunjuk ke SRAM STM32H523 (0x20000000 range)
+  *         4. Set MSP baru
+  *         5. Jump ke Reset_Handler
+  *
+  *         NOTE: Tidak ada deinit peripheral apapun sebelum jump,
+  *         karena OctoSPI harus tetap aktif agar XIP berjalan!
+  */
+static void Jump_To_App(void)
+{
+    /* --- Baca vektor table dari awal flash eksternal --------------------- */
+    uint32_t app_msp    = *(__IO uint32_t *)(APP_ADDRESS);        /* offset 0 */
+    uint32_t app_reset  = *(__IO uint32_t *)(APP_ADDRESS + 4U);   /* offset 4 */
+
+    /*
+     * Validasi MSP:
+     * STM32H523 SRAM ada di 0x20000000 .. 0x20044000 (272 KB)
+     * Jika MSP di luar range ini, anggap flash kosong / korup
+     */
+    if ((app_msp & 0xFF000000U) != 0x20000000U)
+    {
+        /* Flash eksternal kosong atau tidak valid — berhenti di sini        */
+        /* Tambahkan LED blink / error indicator sesuai kebutuhan           */
+        while (1)
+        {
+            /* Tunggu — tidak ada yang bisa dilakukan tanpa aplikasi valid  */
+        }
+    }
+
+    /* --- Disable semua interrupt sebelum jump ---------------------------- */
+    __disable_irq();
+
+    /* --- Reset NVIC: clear semua pending interrupt ----------------------- */
+    for (uint8_t i = 0; i < 8U; i++)
+    {
+        NVIC->ICER[i] = 0xFFFFFFFFU;  /* Disable semua IRQ                 */
+        NVIC->ICPR[i] = 0xFFFFFFFFU;  /* Clear pending                     */
+    }
+
+    /* --- Set Vector Table ke lokasi aplikasi di OctoSPI ------------------ */
+    SCB->VTOR = APP_ADDRESS;
+
+    /* --- Set Main Stack Pointer ke nilai dari vektor table aplikasi ------ */
+    __set_MSP(app_msp);
+
+    /* --- Set Process Stack Pointer (untuk OS compatibility) -------------- */
+    __set_PSP(app_msp);
+
+    /* --- Ensure instruction & data sync sebelum jump --------------------- */
+    __ISB();
+    __DSB();
+
+    /* --- Buat function pointer ke Reset_Handler aplikasi ----------------- */
+    pFunction jump = (pFunction)(app_reset);
+
+    /* --- JUMP! ----------------------------------------------------------- */
+    jump();
+
+    /* Tidak seharusnya sampai sini                                          */
+    while (1);
+}
 
 /* USER CODE END 0 */
 
@@ -71,9 +163,6 @@ int main(void)
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
-
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
@@ -87,8 +176,14 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_OCTOSPI1_Init();
+
   /* USER CODE BEGIN 2 */
+
+  /* --- Init OctoSPI1 → Memory-Mapped mode (bare-metal, tanpa HAL) ------ */
+  OCTOSPI1_LL_Init();
+
+  /* --- Langsung jump ke aplikasi di flash eksternal (XIP) -------------- */
+  Jump_To_App();
 
   /* USER CODE END 2 */
 
@@ -154,11 +249,10 @@ void SystemClock_Config(void)
   LL_RCC_SetAPB3Prescaler(LL_RCC_APB3_DIV_1);
   LL_SetSystemCoreClock(250000000);
 
-   /* Update the time base */
-  if (HAL_InitTick (TICK_INT_PRIORITY) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  /*
+   * HAL_InitTick sengaja tidak dipanggil — bootloader tidak butuh SysTick.
+   * SystemClock_Config selesai dengan LL murni.
+   */
 }
 
 /* USER CODE BEGIN 4 */
@@ -167,7 +261,7 @@ void SystemClock_Config(void)
 
 /**
   * @brief  This function is executed in case of error occurrence.
-  * @param None
+  * @param  None
   * @retval None
   */
 void Error_Handler(void)
@@ -180,6 +274,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
@@ -189,7 +284,7 @@ void Error_Handler(void)
   * @retval None
   */
 void assert_failed(uint8_t *file, uint32_t line)
-{
+{/* Private includes ----------------------------------------------------------*/
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line number,
      ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
