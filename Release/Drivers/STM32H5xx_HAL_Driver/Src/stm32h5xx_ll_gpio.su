@@ -1,0 +1,5 @@
+../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_ll_bus.h:1164:22:LL_AHB2_GRP1_ForceReset	0	static
+../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_ll_bus.h:1217:22:LL_AHB2_GRP1_ReleaseReset	0	static
+../Drivers/STM32H5xx_HAL_Driver/Src/stm32h5xx_ll_gpio.c:104:13:LL_GPIO_DeInit	8	static
+../Drivers/STM32H5xx_HAL_Driver/Src/stm32h5xx_ll_gpio.c:200:13:LL_GPIO_Init	48	static,ignoring_inline_asm
+../Drivers/STM32H5xx_HAL_Driver/Src/stm32h5xx_ll_gpio.c:272:6:LL_GPIO_StructInit	0	static
