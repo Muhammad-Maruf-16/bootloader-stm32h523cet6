@@ -69,6 +69,8 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define BOOT_MODE_Pin LL_GPIO_PIN_0
+#define BOOT_MODE_GPIO_Port GPIOA
 #define ETH_RST_Pin LL_GPIO_PIN_4
 #define ETH_RST_GPIO_Port GPIOA
 #define ETH_CS_Pin LL_GPIO_PIN_2

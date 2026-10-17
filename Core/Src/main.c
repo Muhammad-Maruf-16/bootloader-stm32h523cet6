@@ -2,21 +2,21 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Bootloader STM32H523CET6 — XIP via OctoSPI Memory-Mapped
+  * @brief          : Bootloader STM32H523CET6
+  *                   - Backup Image : Flash Internal @ 0x08002000 (Sektor 1..63)
+  *                   - App Image    : Flash Eksternal OctoSPI XIP @ 0x90001000
   *
   * ALUR:
   *  1. Init clock (LL) + GPIO (LL) + CRC (LL)
   *  2. Init OctoSPI → Indirect Read mode
-  *  3. Baca META dari flash eksternal (flag, size, CRC)
-  *  4. Jika flag staging valid → verifikasi CRC32 firmware
-  *     - CRC OK  : clear flag, switch MM mode, jump ke APP_ADDRESS
-  *     - CRC FAIL: coba area backup, jump ke backup
-  *  5. Jika tidak ada staging → cek MSP valid, jump ke APP_ADDRESS
+  *  3. Baca metadata App dari flash eksternal (size, CRC, flag)
+  *  4. Verifikasi firmware App di flash eksternal:
+  *     - CRC OK  : jika flag OTA 0xA5, clear flag, switch MM mode, jump ke APP (0x90001000)
+  *     - CRC FAIL / App Kosong: jump ke Backup di flash internal (0x08002000)
   *
   * CATATAN:
-  *  - Tidak ada copy ke SRAM — CPU langsung XIP dari 0x90000000
-  *  - OctoSPI TIDAK boleh di-deinit setelah jump (flash tetap harus aktif)
-  *  - Linker script aplikasi harus set FLASH origin = 0x90000000
+  *  - Flash internal STM32H5 sektor = 8 KB. Sektor 0 (0x08000000) = Bootloader.
+  *  - OctoSPI TIDAK boleh di-deinit saat jump ke App (flash tetap harus aktif untuk XIP).
   ******************************************************************************
   * @attention
   *
@@ -52,33 +52,29 @@ typedef void (*pFunction)(void);
 /* USER CODE BEGIN PD */
 
 /* --------------------------------------------------------------------------
- * UKURAN SEKTOR & ALOKASI PARTISI (INCREMENTAL)
+ * ALOKASI PARTISI FLASH INTERNAL (STM32H523 - 512 KB Total, Sektor = 8 KB)
  * -------------------------------------------------------------------------- */
-#define EXTFLASH_SECTOR_SIZE    (4UL * 1024UL)          /* 4 KB (1 sector SPI flash)    */
-#define FLASH_META_SIZE         EXTFLASH_SECTOR_SIZE    /* 4 KB sektor metadata         */
-#define FLASH_BACKUP_MAX_SIZE   (60UL * 1024UL)         /* 60 KB batas binary backup    */
-#define FLASH_APP_MAX_SIZE      (4UL * 1024UL * 1024UL) /* 4 MB batas binary aplikasi   */
+/* Sektor 0   : Bootloader  (0x08000000 - 0x08001FFF, 8 KB)                  */
+/* Sektor 1.. : Backup Image (0x08002000 - 0x0807FFFF, 504 KB)               */
+#define BACKUP_APP_ADDRESS      (0x08002000UL)
 
 /* --------------------------------------------------------------------------
- * PENGALAMATAN INCREMENTAL DI FLASH EKSTERNAL (PHYSICAL OFFSET)
+ * ALOKASI PARTISI FLASH EKSTERNAL (OctoSPI Physical Offset)
  * -------------------------------------------------------------------------- */
-/* 1. SLOT BACKUP (Golden Image) */
-#define FLASH_BACKUP_META       (0x00000000UL)
-#define FLASH_BACKUP_BIN        (FLASH_BACKUP_META + FLASH_META_SIZE) /* +4 KB = 0x1000 */
-
-/* 2. SLOT APLIKASI UTAMA / STAGING OTA */
-#define FLASH_APP_BASE          (FLASH_BACKUP_BIN + FLASH_BACKUP_MAX_SIZE) /* +60 KB = 64 KB (0x10000) */
-#define FLASH_APP_META          (FLASH_APP_BASE)                           /* 0x10000                   */
-#define FLASH_APP_BIN           (FLASH_APP_META + FLASH_META_SIZE)         /* +4 KB = 68 KB (0x11000)   */
+#define EXTFLASH_SECTOR_SIZE    (4UL * 1024UL)          /* 4 KB (1 sector SPI flash)    */
+#define FLASH_APP_META          (0x00000000UL)          /* Sektor 0 (0 KB - 4 KB): Meta */
+#define FLASH_APP_BIN           (FLASH_APP_META + EXTFLASH_SECTOR_SIZE) /* 0x00001000 (4 KB)   */
+#define FLASH_STAGING_META      (0x00100000UL)          /* Sektor 256 (1 MB): Staging Meta */
+#define FLASH_STAGING_BIN       (FLASH_STAGING_META + EXTFLASH_SECTOR_SIZE) /* 0x00101000 (1 MB + 4 KB) */
+#define FLASH_APP_MAX_SIZE      (1020UL * 1024UL)       /* ~1020 KB batas binary aplikasi   */
 
 #define STAGING_FLAG_VALID      0xA5U
 
 /* --------------------------------------------------------------------------
  * ALAMAT MEMORY-MAPPED (CPU SPACE @ 0x90000000)
  * -------------------------------------------------------------------------- */
-#define APP_BACKUP_MM_ADDRESS   (OCTOSPI1_MM_BASE + FLASH_BACKUP_BIN) /* 0x90001000 */
-#define APP_MM_ADDRESS          (OCTOSPI1_MM_BASE + FLASH_APP_BIN)    /* 0x90011000 */
-#define APP_ADDRESS             APP_MM_ADDRESS                        /* Alias      */
+#define APP_MM_ADDRESS          (OCTOSPI1_MM_BASE + FLASH_APP_BIN) /* 0x90001000 */
+#define APP_ADDRESS             APP_MM_ADDRESS                     /* Alias      */
 
 /* USER CODE END PD */
 
@@ -97,7 +93,7 @@ typedef void (*pFunction)(void);
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void Boot_CheckAndJump(void);
-static void Jump_To_Address(uint32_t mm_address);
+static void Jump_To_Address(uint32_t address);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -153,44 +149,12 @@ static void Flash_ReadBytes_Indirect(uint32_t flash_offset, uint8_t *buf, uint32
 }
 
 /* ==========================================================================
- * HELPER: Tulis 1 byte ke flash via OctoSPI Indirect Write
- * Khusus untuk clear flag staging (bit-flip 0xA5 → 0x00)
- * Membutuhkan WREN terlebih dahulu
+ * HELPER: Tunggu proses internal Flash (WIP bit = 0)
  * ========================================================================== */
-static void Flash_WriteByte_Indirect(uint32_t flash_offset, uint8_t byte)
+static void Flash_WaitBusy_Indirect(void)
 {
-    /* WREN (Write Enable)                                                   */
-    OCTOSPI1_LL_SendCmd(FLASH_CMD_WREN);
-
-    /* Tunggu tidak busy                                                     */
-    while (OCTOSPI1->SR & OCTOSPI_SR_BUSY);
-
-    OCTOSPI1->DLR = 0U; /* 1 byte data */
-
-    /* CCR: Indirect Write, 1-1-1                                            */
-    OCTOSPI1->CCR = (1U << OCTOSPI_CCR_IMODE_Pos)
-                  | (1U << OCTOSPI_CCR_ADMODE_Pos)
-                  | (2U << OCTOSPI_CCR_ADSIZE_Pos)
-                  | (1U << OCTOSPI_CCR_DMODE_Pos);
-
-    /* FMODE = 00 → Indirect Write                                           */
-    OCTOSPI1->CR = (OCTOSPI1->CR & ~OCTOSPI_CR_FMODE_Msk);
-
-    OCTOSPI1->IR = 0x02U; /* Page Program                                   */
-    OCTOSPI1->AR = flash_offset;
-
-    /* Tulis byte                                                            */
-    *(__IO uint8_t *)(&OCTOSPI1->DR) = byte;
-
-    while (!(OCTOSPI1->SR & OCTOSPI_SR_TCF));
-    OCTOSPI1->FCR = OCTOSPI_FCR_CTCF;
-
-    /* Tunggu flash selesai write (polling status register)                  */
     uint8_t status;
     do {
-        Flash_ReadBytes_Indirect(0x00000000UL, &status, 0); /* dummy reset  */
-
-        /* Baca Status Register flash (cmd 0x05)                            */
         while (OCTOSPI1->SR & OCTOSPI_SR_BUSY);
         OCTOSPI1->DLR = 0U;
         OCTOSPI1->CCR = (1U << OCTOSPI_CCR_IMODE_Pos)
@@ -204,7 +168,129 @@ static void Flash_WriteByte_Indirect(uint32_t flash_offset, uint8_t byte)
         while (!(OCTOSPI1->SR & OCTOSPI_SR_TCF));
         OCTOSPI1->FCR = OCTOSPI_FCR_CTCF;
         OCTOSPI1->CR  = (OCTOSPI1->CR & ~OCTOSPI_CR_FMODE_Msk);
-    } while (status & 0x01U); /* WIP bit = 1 → masih busy                   */
+    } while (status & 0x01U);
+}
+
+/* ==========================================================================
+ * HELPER: Tulis 1 byte ke flash via OctoSPI Indirect Write
+ * ========================================================================== */
+static void Flash_WriteByte_Indirect(uint32_t flash_offset, uint8_t byte)
+{
+    Flash_WaitBusy_Indirect();
+    OCTOSPI1_LL_SendCmd(FLASH_CMD_WREN);
+
+    while (OCTOSPI1->SR & OCTOSPI_SR_BUSY);
+    OCTOSPI1->DLR = 0U;
+    OCTOSPI1->CCR = (1U << OCTOSPI_CCR_IMODE_Pos)
+                  | (1U << OCTOSPI_CCR_ADMODE_Pos)
+                  | (2U << OCTOSPI_CCR_ADSIZE_Pos)
+                  | (1U << OCTOSPI_CCR_DMODE_Pos);
+    OCTOSPI1->CR = (OCTOSPI1->CR & ~OCTOSPI_CR_FMODE_Msk);
+    OCTOSPI1->IR = 0x02U; /* Page Program */
+    OCTOSPI1->AR = flash_offset;
+
+    *(__IO uint8_t *)(&OCTOSPI1->DR) = byte;
+
+    while (!(OCTOSPI1->SR & OCTOSPI_SR_TCF));
+    OCTOSPI1->FCR = OCTOSPI_FCR_CTCF;
+
+    Flash_WaitBusy_Indirect();
+}
+
+/* ==========================================================================
+ * HELPER: Erase 1 sektor (4 KB) di flash eksternal
+ * ========================================================================== */
+static void Flash_EraseSector_Indirect(uint32_t flash_offset)
+{
+    Flash_WaitBusy_Indirect();
+    OCTOSPI1_LL_SendCmd(FLASH_CMD_WREN);
+
+    while (OCTOSPI1->SR & OCTOSPI_SR_BUSY);
+    OCTOSPI1->DLR = 0U;
+    OCTOSPI1->CCR = (1U << OCTOSPI_CCR_IMODE_Pos)
+                  | (1U << OCTOSPI_CCR_ADMODE_Pos)
+                  | (2U << OCTOSPI_CCR_ADSIZE_Pos);
+    OCTOSPI1->CR  = (OCTOSPI1->CR & ~OCTOSPI_CR_FMODE_Msk);
+    OCTOSPI1->IR  = 0x20U; /* Sector Erase 4KB */
+    OCTOSPI1->AR  = flash_offset;
+
+    while (!(OCTOSPI1->SR & OCTOSPI_SR_TCF));
+    OCTOSPI1->FCR = OCTOSPI_FCR_CTCF;
+
+    Flash_WaitBusy_Indirect();
+}
+
+/* ==========================================================================
+ * HELPER: Tulis 1 page (maks 256 byte) ke flash eksternal
+ * ========================================================================== */
+static void Flash_WritePage_Indirect(uint32_t flash_offset, const uint8_t *data, uint16_t len)
+{
+    if (len == 0 || len > 256) return;
+    Flash_WaitBusy_Indirect();
+    OCTOSPI1_LL_SendCmd(FLASH_CMD_WREN);
+
+    while (OCTOSPI1->SR & OCTOSPI_SR_BUSY);
+    OCTOSPI1->DLR = (uint32_t)(len - 1U);
+    OCTOSPI1->CCR = (1U << OCTOSPI_CCR_IMODE_Pos)
+                  | (1U << OCTOSPI_CCR_ADMODE_Pos)
+                  | (2U << OCTOSPI_CCR_ADSIZE_Pos)
+                  | (1U << OCTOSPI_CCR_DMODE_Pos);
+    OCTOSPI1->CR  = (OCTOSPI1->CR & ~OCTOSPI_CR_FMODE_Msk);
+    OCTOSPI1->IR  = 0x02U; /* Page Program */
+    OCTOSPI1->AR  = flash_offset;
+
+    for (uint16_t i = 0; i < len; i++)
+    {
+        while (!(OCTOSPI1->SR & OCTOSPI_SR_FTF) &&
+               !(OCTOSPI1->SR & OCTOSPI_SR_TCF));
+        *(__IO uint8_t *)(&OCTOSPI1->DR) = data[i];
+    }
+
+    while (!(OCTOSPI1->SR & OCTOSPI_SR_TCF));
+    OCTOSPI1->FCR = OCTOSPI_FCR_CTCF;
+
+    Flash_WaitBusy_Indirect();
+}
+
+/* ==========================================================================
+ * HELPER: Salin firmware dari STAGING (0x00101000) ke APP (0x00001000)
+ * ========================================================================== */
+static void Boot_CopyStagingToApp(uint32_t size, uint32_t crc)
+{
+    /* 1. Hapus sektor-sektor aplikasi aktif (FLASH_APP_BIN) */
+    uint32_t sectors = (size + EXTFLASH_SECTOR_SIZE - 1U) / EXTFLASH_SECTOR_SIZE;
+    for (uint32_t s = 0; s < sectors; s++)
+    {
+        Flash_EraseSector_Indirect(FLASH_APP_BIN + (s * EXTFLASH_SECTOR_SIZE));
+    }
+
+    /* 2. Salin binary dari FLASH_STAGING_BIN ke FLASH_APP_BIN per page (256 byte) */
+    uint8_t page_buf[256];
+    uint32_t copied = 0;
+    while (copied < size)
+    {
+        uint16_t chunk = (size - copied > sizeof(page_buf)) ? (uint16_t)sizeof(page_buf) : (uint16_t)(size - copied);
+        Flash_ReadBytes_Indirect(FLASH_STAGING_BIN + copied, page_buf, chunk);
+        Flash_WritePage_Indirect(FLASH_APP_BIN + copied, page_buf, chunk);
+        copied += chunk;
+    }
+
+    /* 3. Tulis metadata aplikasi di FLASH_APP_META */
+    Flash_EraseSector_Indirect(FLASH_APP_META);
+    uint8_t app_meta[10] = { 0 };
+    app_meta[0] = (uint8_t)(size);
+    app_meta[1] = (uint8_t)(size >> 8);
+    app_meta[2] = (uint8_t)(size >> 16);
+    app_meta[3] = (uint8_t)(size >> 24);
+    app_meta[4] = (uint8_t)(crc);
+    app_meta[5] = (uint8_t)(crc >> 8);
+    app_meta[6] = (uint8_t)(crc >> 16);
+    app_meta[7] = (uint8_t)(crc >> 24);
+    app_meta[8] = 0x00; /* Flag App Normal */
+    Flash_WritePage_Indirect(FLASH_APP_META, app_meta, 10);
+
+    /* 4. Hapus flag valid staging (tulis 0x00 ke byte ke-8 di FLASH_STAGING_META) */
+    Flash_WriteByte_Indirect(FLASH_STAGING_META + 8U, 0x00U);
 }
 
 /* ==========================================================================
@@ -250,13 +336,12 @@ static uint32_t CRC32_ComputeFromFlash(uint32_t flash_offset, uint32_t size_byte
 }
 
 /* ==========================================================================
- * HELPER: Jump ke aplikasi di alamat memory-mapped tertentu
- * Dipanggil SETELAH OctoSPI sudah dalam Memory-Mapped mode
+ * HELPER: Jump ke aplikasi di alamat tertentu (Internal Flash atau XIP MM)
  * ========================================================================== */
-static void Jump_To_Address(uint32_t mm_address)
+static void Jump_To_Address(uint32_t address)
 {
-    uint32_t app_msp   = *(__IO uint32_t *)(mm_address);
-    uint32_t app_reset = *(__IO uint32_t *)(mm_address + 4U);
+    uint32_t app_msp   = *(__IO uint32_t *)(address);
+    uint32_t app_reset = *(__IO uint32_t *)(address + 4U);
 
     /* Validasi MSP: harus di range SRAM STM32H523 (0x20000000..0x20044000) */
     if ((app_msp & 0xFF000000U) != 0x20000000U)
@@ -279,12 +364,10 @@ static void Jump_To_Address(uint32_t mm_address)
     }
 
     /* Pindahkan Vector Table ke lokasi aplikasi                             */
-    SCB->VTOR = mm_address;
+    SCB->VTOR = address;
 
-    /* Reset seluruh SRAM STM32H523 (272 KB: 0x20000000 .. 0x20044000)      */
-    uint32_t *ram     = (uint32_t *)0x20000000UL;
-    uint32_t *ram_end = (uint32_t *)(0x20000000UL + (272UL * 1024UL));
-    while (ram < ram_end) *ram++ = 0U;
+    /* Reset MSPLIM (Stack Pointer Limit) untuk Cortex-M33                   */
+    __set_MSPLIM(0);
 
     __DSB();
     __ISB();
@@ -302,106 +385,155 @@ static void Jump_To_Address(uint32_t mm_address)
 }
 
 /* ==========================================================================
- * MAIN LOGIC: Cek staging, verifikasi CRC, lalu jump
+ * MAIN LOGIC: Cek firmware App di Flash Eksternal, lalu fallback ke Backup
  *
  * Alur:
- *  1. Init OctoSPI Indirect mode
- *  2. Baca STAGING_META → cek flag 0xA5
- *  3. Jika ada staging:
- *       - Hitung CRC32 dari STAGING_BIN
- *       - Cocok → clear flag → aktifkan MM mode → jump ke APP
- *       - Gagal → coba BACKUP → aktifkan MM mode → jump ke backup
- *  4. Tidak ada staging:
- *       - Cek MSP di awal flash (indirect read)
- *       - Valid → aktifkan MM mode → jump ke APP
- *       - Tidak valid → coba backup
+ *  1. Baca FLASH_APP_META dari OctoSPI flash:
+ *     Format metadata: [0..3]=size, [4..7]=crc32, [8]=flag (0xA5 jika baru OTA)
+ *  2. Jika size valid & MSP valid:
+ *     - Hitung hardware CRC32 dari binary di FLASH_APP_BIN (0x00001000)
+ *     - Jika CRC cocok:
+ *         * Clear flag 0xA5 (jika ada) di byte ke-8
+ *         * Aktifkan mode Memory-Mapped OctoSPI
+ *         * Jump ke APP_MM_ADDRESS (0x90001000)
+ *  3. Jika App tidak valid / corrupt:
+ *     - Cek firmware Backup di Flash Internal (0x08002000)
+ *     - Jika MSP valid: Jump ke Backup (0x08002000)
+ *  4. Jika keduanya tidak valid: CPU hang (while 1)
  * ========================================================================== */
 static void Boot_CheckAndJump(void)
 {
-    uint8_t meta[9]; /* [0]=flag, [1..4]=size, [5..8]=crc32                 */
-    uint8_t msp_bytes[4];
+    /* ======================================================================
+     * 0. MANUAL RECOVERY MODE (TOMBOL BOOT_MODE / PA0)
+     *    Jika pin BOOT_MODE ditekan ke GND (LOW saat startup/reset),
+     *    langsung paksa meloncat ke program Backup di internal flash.
+     * ====================================================================== */
+    if (LL_GPIO_IsInputPinSet(BOOT_MODE_GPIO_Port, BOOT_MODE_Pin) == 0)
+    {
+        uint32_t backup_msp = *(__IO uint32_t *)(BACKUP_APP_ADDRESS);
+        if ((backup_msp & 0xFF000000U) == 0x20000000U)
+        {
+            Jump_To_Address(BACKUP_APP_ADDRESS);
+        }
+    }
+
+    uint8_t  meta[10];
+    uint8_t  app_valid = 0;
 
     /* ======================================================================
-     * 1. CEK FIRMWARE APLIKASI UTAMA (FLASH_APP_META & FLASH_APP_BIN)
+     * 1. CEK FIRMWARE BARU DI STAGING AREA (HASIL OTA DARI APP)
+     * ====================================================================== */
+    Flash_ReadBytes_Indirect(FLASH_STAGING_META, meta, sizeof(meta));
+
+    uint32_t size_stg = (uint32_t)meta[0]
+                      | ((uint32_t)meta[1] << 8U)
+                      | ((uint32_t)meta[2] << 16U)
+                      | ((uint32_t)meta[3] << 24U);
+    uint32_t crc_stg  = (uint32_t)meta[4]
+                      | ((uint32_t)meta[5] << 8U)
+                      | ((uint32_t)meta[6] << 16U)
+                      | ((uint32_t)meta[7] << 24U);
+    uint8_t  flag_stg = meta[8];
+
+    if (flag_stg == STAGING_FLAG_VALID && size_stg > 0U && size_stg <= FLASH_APP_MAX_SIZE)
+    {
+        /* Validasi header binary staging (MSP & Reset Handler) */
+        uint8_t hdr_stg[8];
+        Flash_ReadBytes_Indirect(FLASH_STAGING_BIN, hdr_stg, 8U);
+        uint32_t msp_stg = (uint32_t)hdr_stg[0]
+                         | ((uint32_t)hdr_stg[1] << 8U)
+                         | ((uint32_t)hdr_stg[2] << 16U)
+                         | ((uint32_t)hdr_stg[3] << 24U);
+        uint32_t rst_stg = (uint32_t)hdr_stg[4]
+                         | ((uint32_t)hdr_stg[5] << 8U)
+                         | ((uint32_t)hdr_stg[6] << 16U)
+                         | ((uint32_t)hdr_stg[7] << 24U);
+
+        /* MSP harus di SRAM (0x20xxxxxx) & 4-byte aligned; Reset vector harus di OctoSPI (0x90xxxxxx) & Thumb bit (ganjil) */
+        if (((msp_stg & 0xFF000000U) == 0x20000000U) && ((msp_stg & 0x03U) == 0U) &&
+            ((rst_stg & 0xFF000000U) == 0x90000000U) && ((rst_stg & 0x01U) == 1U))
+        {
+            uint32_t crc_calc = CRC32_ComputeFromFlash(FLASH_STAGING_BIN, size_stg);
+            if (crc_calc == crc_stg)
+            {
+                /* Valid binary STM32! Salin dari Staging ke Active App */
+                Boot_CopyStagingToApp(size_stg, crc_stg);
+            }
+            else
+            {
+                /* CRC staging tidak cocok (data rusak) -> Hapus flag staging */
+                Flash_WriteByte_Indirect(FLASH_STAGING_META + 8U, 0x00U);
+            }
+        }
+        else
+        {
+            /* Binary bukan untuk STM32 (misal ESP8266) -> Hapus flag staging, tolak update */
+            Flash_WriteByte_Indirect(FLASH_STAGING_META + 8U, 0x00U);
+        }
+    }
+
+    /* ======================================================================
+     * 2. CEK FIRMWARE APLIKASI UTAMA DI FLASH EKSTERNAL (XIP OctoSPI)
      * ====================================================================== */
     Flash_ReadBytes_Indirect(FLASH_APP_META, meta, sizeof(meta));
 
-    uint8_t  flag_app = meta[0];
-    uint32_t size_app = (uint32_t)meta[1]
-                      | ((uint32_t)meta[2] << 8U)
-                      | ((uint32_t)meta[3] << 16U)
-                      | ((uint32_t)meta[4] << 24U);
-    uint32_t crc_app  = (uint32_t)meta[5]
-                      | ((uint32_t)meta[6] << 8U)
-                      | ((uint32_t)meta[7] << 16U)
-                      | ((uint32_t)meta[8] << 24U);
+    uint32_t size_app = (uint32_t)meta[0]
+                      | ((uint32_t)meta[1] << 8U)
+                      | ((uint32_t)meta[2] << 16U)
+                      | ((uint32_t)meta[3] << 24U);
+    uint32_t crc_app  = (uint32_t)meta[4]
+                      | ((uint32_t)meta[5] << 8U)
+                      | ((uint32_t)meta[6] << 16U)
+                      | ((uint32_t)meta[7] << 24U);
 
     if (size_app > 0U && size_app <= FLASH_APP_MAX_SIZE)
     {
-        /* Validasi Initial Stack Pointer (MSP) di awal binary aplikasi */
-        Flash_ReadBytes_Indirect(FLASH_APP_BIN, msp_bytes, 4U);
-        uint32_t msp_app = (uint32_t)msp_bytes[0]
-                         | ((uint32_t)msp_bytes[1] << 8U)
-                         | ((uint32_t)msp_bytes[2] << 16U)
-                         | ((uint32_t)msp_bytes[3] << 24U);
+        /* Validasi Initial Stack Pointer (MSP) dan Reset Handler di awal binary aplikasi */
+        uint8_t hdr_bytes[8];
+        Flash_ReadBytes_Indirect(FLASH_APP_BIN, hdr_bytes, 8U);
+        uint32_t msp_app = (uint32_t)hdr_bytes[0]
+                         | ((uint32_t)hdr_bytes[1] << 8U)
+                         | ((uint32_t)hdr_bytes[2] << 16U)
+                         | ((uint32_t)hdr_bytes[3] << 24U);
+        uint32_t rst_app = (uint32_t)hdr_bytes[4]
+                         | ((uint32_t)hdr_bytes[5] << 8U)
+                         | ((uint32_t)hdr_bytes[6] << 16U)
+                         | ((uint32_t)hdr_bytes[7] << 24U);
 
-        if ((msp_app & 0xFF000000U) == 0x20000000U)
+        /* MSP harus di SRAM (0x20xxxxxx) & 4-byte aligned; Reset vector harus di OctoSPI (0x90xxxxxx) & Thumb bit (ganjil) */
+        if (((msp_app & 0xFF000000U) == 0x20000000U) && ((msp_app & 0x03U) == 0U) &&
+            ((rst_app & 0xFF000000U) == 0x90000000U) && ((rst_app & 0x01U) == 1U))
         {
-            /* Hitung CRC32 dari binary aplikasi via hardware CRC */
+            /* Hitung hardware CRC32 dari binary aplikasi */
             uint32_t crc_calc = CRC32_ComputeFromFlash(FLASH_APP_BIN, size_app);
 
             if (crc_calc == crc_app)
             {
-                /* Jika baru saja di-download OTA (flag 0xA5), clear flag */
-                if (flag_app == STAGING_FLAG_VALID)
-                {
-                    Flash_WriteByte_Indirect(FLASH_APP_META, 0x00U);
-                }
-
-                /* CRC cocok → aktifkan mode Memory-Mapped → Jump ke APP */
-                OCTOSPI1_LL_MemoryMapped();
-                Jump_To_Address(APP_MM_ADDRESS);
+                app_valid = 1;
             }
         }
     }
 
-    /* ======================================================================
-     * 2. JIKA APP GAGAL / KORUP: CEK FIRMWARE BACKUP
-     * ====================================================================== */
-    Flash_ReadBytes_Indirect(FLASH_BACKUP_META, meta, sizeof(meta));
-
-    uint32_t size_backup = (uint32_t)meta[1]
-                         | ((uint32_t)meta[2] << 8U)
-                         | ((uint32_t)meta[3] << 16U)
-                         | ((uint32_t)meta[4] << 24U);
-    uint32_t crc_backup  = (uint32_t)meta[5]
-                         | ((uint32_t)meta[6] << 8U)
-                         | ((uint32_t)meta[7] << 16U)
-                         | ((uint32_t)meta[8] << 24U);
-
-    if (size_backup > 0U && size_backup <= FLASH_BACKUP_MAX_SIZE)
+    if (app_valid)
     {
-        Flash_ReadBytes_Indirect(FLASH_BACKUP_BIN, msp_bytes, 4U);
-        uint32_t msp_backup = (uint32_t)msp_bytes[0]
-                            | ((uint32_t)msp_bytes[1] << 8U)
-                            | ((uint32_t)msp_bytes[2] << 16U)
-                            | ((uint32_t)msp_bytes[3] << 24U);
-
-        if ((msp_backup & 0xFF000000U) == 0x20000000U)
-        {
-            uint32_t crc_calc = CRC32_ComputeFromFlash(FLASH_BACKUP_BIN, size_backup);
-
-            if (crc_calc == crc_backup)
-            {
-                /* CRC Backup cocok → aktifkan MM mode → Jump ke Backup */
-                OCTOSPI1_LL_MemoryMapped();
-                Jump_To_Address(APP_BACKUP_MM_ADDRESS);
-            }
-        }
+        /* CRC cocok → aktifkan mode Memory-Mapped → Jump ke APP */
+        OCTOSPI1_LL_MemoryMapped();
+        Jump_To_Address(APP_MM_ADDRESS);
     }
 
     /* ======================================================================
-     * 3. FLASH KOSONG ATAU DUA-DUANYA KORUP: Tahan CPU di sini
+     * 3. JIKA APP GAGAL / KORUP / KOSONG: JUMP KE FIRMWARE BACKUP
+     *    (Backup berada di Flash Internal @ 0x08002000, Sektor 1)
+     * ====================================================================== */
+    uint32_t backup_msp = *(__IO uint32_t *)(BACKUP_APP_ADDRESS);
+
+    if ((backup_msp & 0xFF000000U) == 0x20000000U)
+    {
+        Jump_To_Address(BACKUP_APP_ADDRESS);
+    }
+
+    /* ======================================================================
+     * 4. FLASH KOSONG ATAU DUA-DUANYA KORUP: Tahan CPU di sini
      * ====================================================================== */
     while (1);
 }
@@ -422,8 +554,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  /* HAL_Init() sengaja tidak dipanggil — bootloader tidak butuh SysTick.   */
-  /* HAL_Init(); */
+  HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -511,8 +642,11 @@ void SystemClock_Config(void)
   LL_RCC_SetAPB3Prescaler(LL_RCC_APB3_DIV_1);
   LL_SetSystemCoreClock(250000000);
 
-  /* HAL_InitTick sengaja tidak dipanggil — bootloader tidak butuh SysTick. */
-  /* if (HAL_InitTick (TICK_INT_PRIORITY) != HAL_OK) { Error_Handler(); }   */
+   /* Update the time base */
+  if (HAL_InitTick (TICK_INT_PRIORITY) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /* USER CODE BEGIN 4 */

@@ -56,6 +56,12 @@ void MX_GPIO_Init(void)
   LL_GPIO_ResetOutputPin(ETH_CS_GPIO_Port, ETH_CS_Pin);
 
   /**/
+  GPIO_InitStruct.Pin = BOOT_MODE_Pin;
+  GPIO_InitStruct.Mode = LL_GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = LL_GPIO_PULL_UP;
+  LL_GPIO_Init(BOOT_MODE_GPIO_Port, &GPIO_InitStruct);
+
+  /**/
   GPIO_InitStruct.Pin = ETH_RST_Pin;
   GPIO_InitStruct.Mode = LL_GPIO_MODE_OUTPUT;
   GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_LOW;

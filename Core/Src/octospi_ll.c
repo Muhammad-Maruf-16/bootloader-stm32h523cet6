@@ -226,43 +226,29 @@ void OCTOSPI1_LL_MemoryMapped(void)
 {
     wait_not_busy();
 
-    /* ---- DLR: Data Length Register — tidak relevan di MM mode ----------- */
-    /* (diabaikan hardware saat FMODE=11)                                    */
+    OCTOSPI1->CR &= ~OCTOSPI_CR_EN;
+    while (OCTOSPI1->CR & OCTOSPI_CR_EN);
 
-    /* ---- CCR: Communication Configuration --------------------------------
-     * IMODE [4:3]   = 01  → Instruction: 1 wire (SIO)
-     * ISIZE [5:4]   = 00  → Instruction: 8-bit
-     * ADMODE[7:6]   = 10  → Address: 4 wire (Quad)
-     * ADSIZE[9:8]   = 10  → Address: 24-bit (3 byte), sesuaikan jika 4-byte
-     * ABMODE[11:10] = 10  → Alternate bytes: 4 wire
-     * ABSIZE[13:12] = 00  → Alternate bytes: 1 byte (mode byte = 0x00)
-     * DMODE [27:26] = 10  → Data: 4 wire (Quad)
-     * DCYC  [22:17] = 6   → Dummy cycles = 6 (sesuaikan dg flash & frekuensi)
-     * -------------------------------------------------------------------- */
-    OCTOSPI1->CCR = (1U  << OCTOSPI_CCR_IMODE_Pos)   /* Instr: 1 line      */
-                  | (0U  << OCTOSPI_CCR_ISIZE_Pos)    /* Instr: 8-bit       */
-                  | (2U  << OCTOSPI_CCR_ADMODE_Pos)   /* Addr: Quad         */
-                  | (2U  << OCTOSPI_CCR_ADSIZE_Pos)   /* Addr: 24-bit       */
-                  | (2U  << OCTOSPI_CCR_ABMODE_Pos)   /* AltByte: Quad      */
-                  | (0U  << OCTOSPI_CCR_ABSIZE_Pos)   /* AltByte: 1 byte    */
-                  | (2U  << OCTOSPI_CCR_DMODE_Pos);   /* Data: Quad         */
+    OCTOSPI1->DCR1 = (24U << OCTOSPI_DCR1_DEVSIZE_Pos)
+                   | (0U  << OCTOSPI_DCR1_CSHT_Pos);
 
-    /* ---- TCR: Timing Configuration (Dummy cycles) ------------------------ */
-    OCTOSPI1->TCR = (FLASH_DUMMY_CYCLES << OCTOSPI_TCR_DCYC_Pos);
+    OCTOSPI1->DCR2 = (3U  << OCTOSPI_DCR2_PRESCALER_Pos);
 
-    /* ---- IR: Instruction — Fast Read Quad I/O command ------------------- */
-    OCTOSPI1->IR  = FLASH_CMD_READ_QUAD;
+    OCTOSPI1->TCR  = (0U  << OCTOSPI_TCR_DCYC_Pos)
+                   | (0U  << OCTOSPI_TCR_SSHIFT_Pos);
 
-    /* ---- ABR: Alternate Bytes Register
-     * Mode byte = 0x00 → continuous read (mode bits off)
-     * Kalau flash Anda pakai XIP continuous mode, set 0xA0
-     * Untuk single-burst read tanpa continuous, gunakan 0x00
-     * -------------------------------------------------------------------- */
-    OCTOSPI1->ABR = 0x00U;
+    OCTOSPI1->CCR = (1U << OCTOSPI_CCR_IMODE_Pos)
+                  | (1U << OCTOSPI_CCR_ADMODE_Pos)
+                  | (2U << OCTOSPI_CCR_ADSIZE_Pos)
+                  | (1U << OCTOSPI_CCR_DMODE_Pos);
 
-    /* ---- CR: Aktifkan Memory-Mapped mode (FMODE = 11b) ------------------ */
+    OCTOSPI1->IR = 0x03U;
+
     OCTOSPI1->CR = (OCTOSPI1->CR & ~OCTOSPI_CR_FMODE_Msk)
                  | (3U << OCTOSPI_CR_FMODE_Pos);
+
+    OCTOSPI1->CR |= OCTOSPI_CR_EN;
+    while (!(OCTOSPI1->CR & OCTOSPI_CR_EN));
 }
 
 /* =========================================================================
